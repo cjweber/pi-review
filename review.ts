@@ -19,6 +19,9 @@
  * - `/review folder src docs` - review specific folders/files (snapshot, not diff)
  * - `/review` selector includes Add/Remove custom review instructions (applies to all modes)
  * - `/review --extra "focus on performance regressions"` - add extra review instruction (works with any mode)
+ * - `/review pr 123 --loop 3` - loop mode: review, fix findings, commit, push, re-review (up to 3 rounds).
+ *   Stops early when a review comes back clean, or when the round limit is reached with findings remaining.
+ *   Loop mode always reviews in the current session (no review branch), so /end-review is not involved.
  *
  * Project-specific review guidelines:
  * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
@@ -47,6 +50,21 @@ import { promises as fs } from "node:fs";
 let reviewOriginId: string | undefined = undefined;
 let endReviewInProgress = false;
 let reviewCustomInstructions: string | undefined = undefined;
+
+// Loop mode state: drives review -> fix -> commit/push -> re-review cycles via agent_settled.
+// Module-level like the other review state: one loop at a time.
+type LoopPhase = "reviewing" | "fixing" | "advancing";
+type LoopState = {
+	phase: LoopPhase;
+	/** Current review round (1-based) */
+	round: number;
+	/** Maximum number of review rounds */
+	maxRounds: number;
+	/** Resolved review target, reused each round (merge base is recomputed per round) */
+	target: ReviewTarget;
+	extraInstruction?: string;
+};
+let loopState: LoopState | undefined = undefined;
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
@@ -659,9 +677,81 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		applyAllReviewState(ctx);
 	});
 
-
 	pi.on("session_tree", (_event, ctx) => {
 		applyAllReviewState(ctx);
+	});
+
+	function getLoopFixPrompt(round: number): string {
+		return `${REVIEW_FIX_FINDINGS_PROMPT}
+10. After implementing the fixes, commit all changes with a concise message (e.g. "Address review findings (round ${round})") and push to the remote tracking branch. If there is nothing to commit, state that explicitly. If the push fails, report the error and stop - do not retry repeatedly.`;
+	}
+
+	function getLastAssistantText(ctx: ExtensionContext): string {
+		const entries = ctx.sessionManager.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const blocks = entry.message.content as Array<{ type: string; text?: string }> | undefined;
+			if (!Array.isArray(blocks)) continue;
+			const text = blocks
+				.filter((b) => b.type === "text" && typeof b.text === "string")
+				.map((b) => b.text ?? "")
+				.join("\n")
+				.trim();
+			if (text) return text;
+		}
+		return "";
+	}
+
+	// Loop driver: advances review -> fix -> commit/push -> re-review each time the agent settles.
+	// ponytail: any settle is treated as the end of the expected phase's run; don't interleave
+	// manual prompts while a loop is active, or cancel it by restarting /review without --loop.
+	pi.on("agent_settled", async (_event, ctx) => {
+		const loop = loopState;
+		if (!loop) return;
+
+		if (loop.phase === "reviewing") {
+			const text = getLastAssistantText(ctx);
+			// Rubric requires verdict "correct" (clean) or "needs attention" (findings).
+			const hasFindings = /needs attention/i.test(text);
+
+			if (!hasFindings) {
+				loopState = undefined;
+				ctx.ui.notify(`Review loop finished: clean review in round ${loop.round}/${loop.maxRounds}. No fixes needed.`, "info");
+				return;
+			}
+
+			if (loop.round >= loop.maxRounds) {
+				loopState = undefined;
+				ctx.ui.notify(
+					`Review loop stopped after ${loop.maxRounds} round(s): findings remain (see above). Fix, commit, and push manually, then run /review again.`,
+					"warning",
+				);
+				return;
+			}
+
+			loop.phase = "fixing";
+			loop.round += 1;
+			pi.sendUserMessage(getLoopFixPrompt(loop.round), { deliverAs: "followUp" });
+			ctx.ui.notify(`Review loop round ${loop.round}/${loop.maxRounds}: fixing findings, then commit + push + re-review.`, "info");
+			return;
+		}
+
+		if (loop.phase === "fixing") {
+			loop.phase = "advancing";
+			const ok = await executeReview(ctx as ExtensionCommandContext, loop.target, false, {
+				extraInstruction: loop.extraInstruction,
+			});
+			if (!ok) {
+				loopState = undefined;
+				ctx.ui.notify("Review loop stopped: failed to start the next review round.", "error");
+				return;
+			}
+			loop.phase = "reviewing";
+			return;
+		}
+
+		// "advancing": settle fired during a loop-driven transition; ignore.
 	});
 
 	/**
@@ -1325,11 +1415,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			// Try to parse direct arguments
+			// Try to parse direct arguments (--loop N is stripped first; the arg parser only knows --extra)
+			const loopMatch = args?.match(/--loop(?:=|\s+)(\d+)/);
+			const loopRounds = loopMatch ? Math.max(1, Number.parseInt(loopMatch[1] ?? "0", 10)) : undefined;
 			let target: ReviewTarget | null = null;
 			let fromSelector = false;
 			let extraInstruction: string | undefined;
-			const parsed = parseArgs(args);
+			const parsed = parseArgs(args?.replace(/--loop(?:=|\s+)\d+/, ""));
 			if (parsed.error) {
 				ctx.ui.notify(parsed.error, "error");
 				return;
@@ -1369,9 +1461,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				const messageCount = entries.filter((e) => e.type === "message").length;
 
 				// In an empty session, default to fresh review mode so /end-review works consistently.
-				let useFreshSession = messageCount === 0;
+				// Loop mode always reviews in the current session (no branch to return from).
+				let useFreshSession = loopRounds === undefined && messageCount === 0;
 
-				if (messageCount > 0) {
+				if (loopRounds === undefined && messageCount > 0) {
 					// Existing session - ask user which mode they want
 					const choice = await ctx.ui.select("Start review in:", ["Empty branch", "Current session"]);
 
@@ -1385,6 +1478,20 @@ export default function reviewExtension(pi: ExtensionAPI) {
 					}
 
 					useFreshSession = choice === "Empty branch";
+				}
+
+				if (loopRounds !== undefined && target) {
+					loopState = {
+						phase: "reviewing",
+						round: 1,
+						maxRounds: loopRounds,
+						target,
+						extraInstruction,
+					};
+					ctx.ui.notify(
+						`Review loop enabled: up to ${loopRounds} round(s) of review → fix findings → commit → push → re-review. Stops early on a clean review.`,
+						"info",
+					);
 				}
 
 				await executeReview(ctx, target, useFreshSession, { extraInstruction });
